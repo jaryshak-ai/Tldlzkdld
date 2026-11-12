@@ -1,0 +1,1023 @@
+name: Build Auction (forms)
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Создать исходники плагина
+        run: |
+          set -e
+          mkdir -p Auction/src/main/java/auction/economy Auction/src/main/resources
+          cat > Auction/pom.xml << 'EOF_0'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <project xmlns="http://maven.apache.org/POM/4.0.0"
+                   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+              <modelVersion>4.0.0</modelVersion>
+              <groupId>auction</groupId>
+              <artifactId>Auction</artifactId>
+              <version>1.0.0</version>
+              <packaging>jar</packaging>
+
+              <properties>
+                  <maven.compiler.source>17</maven.compiler.source>
+                  <maven.compiler.target>17</maven.compiler.target>
+                  <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+              </properties>
+
+              <repositories>
+                  <repository>
+                      <id>lanink</id>
+                      <url>https://repo.lanink.cn/repository/maven-public/</url>
+                  </repository>
+              </repositories>
+
+              <dependencies>
+                  <dependency>
+                      <groupId>cn.nukkit</groupId>
+                      <artifactId>Nukkit</artifactId>
+                      <version>MOT-SNAPSHOT</version>
+                      <scope>provided</scope>
+                  </dependency>
+              </dependencies>
+
+              <build>
+                  <finalName>Auction</finalName>
+                  <plugins>
+                      <plugin>
+                          <groupId>org.apache.maven.plugins</groupId>
+                          <artifactId>maven-compiler-plugin</artifactId>
+                          <version>3.11.0</version>
+                          <configuration>
+                              <release>17</release>
+                              <encoding>UTF-8</encoding>
+                          </configuration>
+                      </plugin>
+                  </plugins>
+              </build>
+          </project>
+          EOF_0
+          cat > Auction/src/main/resources/plugin.yml << 'EOF_1'
+          name: Auction
+          main: auction.AuctionPlugin
+          version: 1.2.0
+          api: ["1.0.0"]
+          author: server
+          description: Рынок (аукцион) с меню на формах
+          depend: [TpCoins]
+          commands:
+            sell:
+              description: Выставить предмет из руки на рынок
+              usage: /sell <цена>
+              permission: auction.use
+            auc:
+              description: Открыть рынок
+              usage: /auc
+              aliases: [ah]
+              permission: auction.use
+            bal:
+              description: Посмотреть свой баланс
+              usage: /bal
+              aliases: [balance]
+              permission: auction.use
+          permissions:
+            auction.use:
+              default: true
+          EOF_1
+          cat > Auction/src/main/resources/config.yml << 'EOF_2'
+          # Комиссия рынка в процентах (удерживается с продавца)
+          commission-percent: 3
+          # Максимум лотов у одного игрока
+          max-lots-per-player: 10
+          # Максимальная цена в /sell
+          max-price: 300000
+          # Если цена выше этой суммы, покупка требует подтверждения
+          confirm-above: 50000
+          EOF_2
+          cat > Auction/src/main/java/auction/economy/Economy.java << 'EOF_3'
+          package auction.economy;
+
+          import cn.nukkit.Player;
+
+          public interface Economy {
+              void ensureAccount(Player player);
+
+              boolean hasAccount(String name);
+
+              long getBalance(String name);
+
+              boolean take(String name, long amount);
+
+              boolean add(String name, long amount);
+
+              boolean canReceive(String name, long amount);
+          }
+          EOF_3
+          cat > Auction/src/main/java/auction/economy/TpCoinsEconomy.java << 'EOF_4'
+          package auction.economy;
+
+          import cn.nukkit.Player;
+          import cn.nukkit.Server;
+          import cn.nukkit.plugin.Plugin;
+
+          import java.lang.reflect.InvocationTargetException;
+          import java.lang.reflect.Method;
+
+          /** Мост к плагину TpCoins через рефлексию (TpCoins должен быть на сервере). */
+          public class TpCoinsEconomy implements Economy {
+              private static final String REASON = "Аукцион";
+
+              private final Object mgr;
+              private final Method norm;
+              private final Method hasAcc;
+              private final Method getBal;
+              private final Method getRoom;
+              private final Method deposit;
+              private final Method withdraw;
+              private final Method ensure;
+
+              public TpCoinsEconomy(Server server) throws Exception {
+                  Plugin plugin = server.getPluginManager().getPlugin("TpCoins");
+                  if (plugin == null) {
+                      throw new IllegalStateException("Плагин TpCoins не найден на сервере");
+                  }
+                  ClassLoader cl = plugin.getClass().getClassLoader();
+                  mgr = plugin.getClass().getMethod("getEconomy").invoke(plugin);
+                  if (mgr == null) {
+                      throw new IllegalStateException("TpCoins ещё не готов (getEconomy вернул null)");
+                  }
+                  Class<?> players = Class.forName("tpcoins.util.Players", true, cl);
+                  norm = players.getMethod("norm", String.class);
+                  Class<?> m = mgr.getClass();
+                  hasAcc = m.getMethod("hasAccount", String.class);
+                  getBal = m.getMethod("getBalance", String.class);
+                  getRoom = m.getMethod("getRoom", String.class);
+                  deposit = m.getMethod("deposit", String.class, long.class, String.class);
+                  withdraw = m.getMethod("withdraw", String.class, long.class, String.class);
+                  ensure = m.getMethod("ensureAccount", Player.class);
+              }
+
+              private String key(String name) throws Exception {
+                  return (String) norm.invoke(null, name);
+              }
+
+              private static RuntimeException wrap(Exception e) {
+                  if (e instanceof InvocationTargetException && e.getCause() != null) {
+                      Throwable c = e.getCause();
+                      return c instanceof RuntimeException ? (RuntimeException) c : new RuntimeException(c);
+                  }
+                  return new RuntimeException(e);
+              }
+
+              @Override
+              public void ensureAccount(Player player) {
+                  try {
+                      ensure.invoke(mgr, player);
+                  } catch (Exception e) {
+                      throw wrap(e);
+                  }
+              }
+
+              @Override
+              public boolean hasAccount(String name) {
+                  try {
+                      return (Boolean) hasAcc.invoke(mgr, key(name));
+                  } catch (Exception e) {
+                      throw wrap(e);
+                  }
+              }
+
+              @Override
+              public long getBalance(String name) {
+                  try {
+                      String k = key(name);
+                      if (!(Boolean) hasAcc.invoke(mgr, k)) {
+                          return 0L;
+                      }
+                      return (Long) getBal.invoke(mgr, k);
+                  } catch (Exception e) {
+                      throw wrap(e);
+                  }
+              }
+
+              @Override
+              public boolean take(String name, long amount) {
+                  if (amount <= 0) {
+                      return false;
+                  }
+                  try {
+                      return "OK".equals(String.valueOf(withdraw.invoke(mgr, key(name), amount, REASON)));
+                  } catch (Exception e) {
+                      throw wrap(e);
+                  }
+              }
+
+              @Override
+              public boolean add(String name, long amount) {
+                  if (amount <= 0) {
+                      return false;
+                  }
+                  try {
+                      return "OK".equals(String.valueOf(deposit.invoke(mgr, key(name), amount, REASON)));
+                  } catch (Exception e) {
+                      throw wrap(e);
+                  }
+              }
+
+              @Override
+              public boolean canReceive(String name, long amount) {
+                  try {
+                      String k = key(name);
+                      if (!(Boolean) hasAcc.invoke(mgr, k)) {
+                          return false;
+                      }
+                      return (Long) getRoom.invoke(mgr, k) >= amount;
+                  } catch (Exception e) {
+                      throw wrap(e);
+                  }
+              }
+          }
+          EOF_4
+          cat > Auction/src/main/java/auction/Lot.java << 'EOF_5'
+          package auction;
+
+          import cn.nukkit.item.Item;
+
+          import java.util.Base64;
+          import java.util.UUID;
+
+          /** Лот на рынке. Формат полей совместим со старым lots.json. */
+          public class Lot {
+              public long id;
+              public String seller;
+              public String sellerName;
+              public long price;
+              public int itemId;
+              public int meta;
+              public int count;
+              public String nbt = "";
+              public long created;
+              private transient Item cached;
+
+              public Lot() {
+              }
+
+              public static Lot of(long id, UUID seller, String sellerName, long price, Item item) {
+                  Lot l = new Lot();
+                  l.id = id;
+                  l.seller = seller.toString();
+                  l.sellerName = sellerName;
+                  l.price = price;
+                  l.itemId = item.getId();
+                  l.meta = item.getDamage();
+                  l.count = item.getCount();
+                  byte[] tag = item.getCompoundTag();
+                  l.nbt = (tag == null || tag.length == 0) ? "" : Base64.getEncoder().encodeToString(tag);
+                  l.created = System.currentTimeMillis();
+                  l.cached = item.clone();
+                  return l;
+              }
+
+              public Item toItem() {
+                  if (cached == null) {
+                      Item it = Item.get(itemId, Integer.valueOf(meta), count);
+                      if (nbt != null && !nbt.isEmpty()) {
+                          it.setCompoundTag(Base64.getDecoder().decode(nbt));
+                      }
+                      cached = it;
+                  }
+                  return cached.clone();
+              }
+          }
+          EOF_5
+          cat > Auction/src/main/java/auction/Enchants.java << 'EOF_6'
+          package auction;
+
+          import cn.nukkit.item.enchantment.Enchantment;
+
+          import java.util.HashMap;
+          import java.util.Map;
+
+          public final class Enchants {
+              public static final Map<Integer, String> NAMES = new HashMap<>();
+              public static final String[] ROMAN = {"", "I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X"};
+
+              static {
+                  String[] n = {
+                          "Защита", "Огнеупорность", "Невесомость", "Взрывоустойчивость", "Защита от снарядов",
+                          "Шипы", "Подводное дыхание", "Подводная ходьба", "Подводник", "Острота",
+                          "Небесная кара", "Бич членистоногих", "Отдача", "Заговор огня", "Добыча",
+                          "Эффективность", "Шёлковое касание", "Прочность", "Удача", "Сила",
+                          "Откидывание", "Горящая стрела", "Бесконечность", "Везучий рыбак", "Приманка",
+                          "Ледоход", "Починка", "Проклятие несъёмности", "Проклятие утраты", "Пронзатель",
+                          "Тягун", "Верность", "Громовержец", "Тройной выстрел", "Пронзающая стрела",
+                          "Быстрая перезарядка", "Скорость души"
+                  };
+                  for (int i = 0; i < n.length; i++) {
+                      NAMES.put(i, n[i]);
+                  }
+              }
+
+              private Enchants() {
+              }
+
+              public static String roman(int level) {
+                  return level >= 1 && level < ROMAN.length ? ROMAN[level] : String.valueOf(level);
+              }
+
+              public static String format(Enchantment[] list) {
+                  StringBuilder sb = new StringBuilder();
+                  for (Enchantment e : list) {
+                      if (e == null) {
+                          continue;
+                      }
+                      if (sb.length() > 0) {
+                          sb.append("§7, §f");
+                      }
+                      sb.append(NAMES.getOrDefault(e.getId(), "Чар #" + e.getId())).append(' ').append(roman(e.getLevel()));
+                  }
+                  return sb.toString();
+              }
+          }
+          EOF_6
+          cat > Auction/src/main/java/auction/AuctionMenu.java << 'EOF_7'
+          package auction;
+
+          import auction.economy.Economy;
+          import cn.nukkit.Player;
+          import cn.nukkit.event.player.PlayerFormRespondedEvent;
+          import cn.nukkit.form.element.Element;
+          import cn.nukkit.form.element.ElementButton;
+          import cn.nukkit.form.element.ElementInput;
+          import cn.nukkit.form.response.FormResponse;
+          import cn.nukkit.form.response.FormResponseCustom;
+          import cn.nukkit.form.response.FormResponseModal;
+          import cn.nukkit.form.response.FormResponseSimple;
+          import cn.nukkit.form.window.FormWindow;
+          import cn.nukkit.form.window.FormWindowCustom;
+          import cn.nukkit.form.window.FormWindowModal;
+          import cn.nukkit.form.window.FormWindowSimple;
+          import cn.nukkit.item.Item;
+          import cn.nukkit.item.enchantment.Enchantment;
+
+          import java.util.ArrayList;
+          import java.util.HashMap;
+          import java.util.List;
+          import java.util.Map;
+          import java.util.UUID;
+          import java.util.function.Consumer;
+
+          /** Меню рынка на формах (FormWindow): работает на любой сборке Nukkit. */
+          public class AuctionMenu {
+              private static final int PER_PAGE = 8;
+
+              private static class State {
+                  boolean mine = false;
+                  String search = "";
+                  int page = 0;
+              }
+
+              private static class Pending {
+                  final int formId;
+                  final Consumer<PlayerFormRespondedEvent> handler;
+
+                  Pending(int formId, Consumer<PlayerFormRespondedEvent> handler) {
+                      this.formId = formId;
+                      this.handler = handler;
+                  }
+              }
+
+              private final AuctionPlugin plugin;
+              private final Map<UUID, State> states = new HashMap<>();
+              private final Map<UUID, Pending> pending = new HashMap<>();
+
+              public AuctionMenu(AuctionPlugin plugin) {
+                  this.plugin = plugin;
+              }
+
+              // ================= служебное =================
+
+              public void quit(Player p) {
+                  states.remove(p.getUniqueId());
+                  pending.remove(p.getUniqueId());
+              }
+
+              public void handleForm(PlayerFormRespondedEvent e) {
+                  Player p = e.getPlayer();
+                  Pending pd = pending.get(p.getUniqueId());
+                  if (pd == null || pd.formId != e.getFormID()) {
+                      return;
+                  }
+                  pending.remove(p.getUniqueId());
+                  try {
+                      pd.handler.accept(e);
+                  } catch (Throwable t) {
+                      plugin.getLogger().error("[Auction] ошибка формы", t);
+                      p.sendMessage("§cОшибка рынка: " + t);
+                  }
+              }
+
+              private State state(Player p) {
+                  return states.computeIfAbsent(p.getUniqueId(), k -> new State());
+              }
+
+              /** Показывает форму с небольшой задержкой (так клиент надёжнее её принимает). */
+              private void show(Player p, FormWindow w, Consumer<PlayerFormRespondedEvent> handler) {
+                  final UUID id = p.getUniqueId();
+                  plugin.getServer().getScheduler().scheduleDelayedTask(plugin, () -> {
+                      if (!p.isOnline()) {
+                          return;
+                      }
+                      int fid = p.showFormWindow(w);
+                      pending.put(id, new Pending(fid, handler));
+                  }, 3);
+              }
+
+              private static String plain(String s) {
+                  return s == null ? "" : s.replaceAll("§.", "");
+              }
+
+              private static String nameOf(Lot lot) {
+                  Item it = lot.toItem();
+                  return it.getName() + (it.getCount() > 1 ? " x" + it.getCount() : "");
+              }
+
+              private int clickedId(PlayerFormRespondedEvent e) {
+                  if (e.wasClosed()) {
+                      return -1;
+                  }
+                  FormResponse r = e.getResponse();
+                  if (r instanceof FormResponseSimple) {
+                      return ((FormResponseSimple) r).getClickedButtonId();
+                  }
+                  return -1;
+              }
+
+              // ================= список лотов =================
+
+              public void open(Player p) {
+                  State st = state(p);
+                  st.page = 0;
+                  openList(p);
+              }
+
+              private List<Lot> filtered(Player p, State st) {
+                  String uid = p.getUniqueId().toString();
+                  String q = st.search.toLowerCase().trim();
+                  List<Lot> out = new ArrayList<>();
+                  for (Lot l : plugin.lots) {
+                      if (st.mine && !uid.equals(l.seller)) {
+                          continue;
+                      }
+                      if (!q.isEmpty() && !plain(l.toItem().getName()).toLowerCase().contains(q)) {
+                          continue;
+                      }
+                      out.add(l);
+                  }
+                  out.sort((a, b) -> Long.compare(b.created, a.created));
+                  return out;
+              }
+
+              private void openList(Player p) {
+                  final State st = state(p);
+                  List<Lot> list = filtered(p, st);
+                  int pages = Math.max(1, (list.size() + PER_PAGE - 1) / PER_PAGE);
+                  if (st.page >= pages) {
+                      st.page = pages - 1;
+                  }
+                  if (st.page < 0) {
+                      st.page = 0;
+                  }
+                  String uid = p.getUniqueId().toString();
+
+                  StringBuilder content = new StringBuilder();
+                  content.append(st.mine ? "§eМои лоты" : "§eВсе лоты")
+                          .append("  §7|  Страница §f").append(st.page + 1).append("§7 из §f").append(pages);
+                  if (!st.search.isEmpty()) {
+                      content.append("\n§7Сейчас ищем: §f").append(st.search);
+                  }
+                  if (list.isEmpty()) {
+                      content.append("\n\n§7Ничего не найдено");
+                  } else {
+                      content.append("\n\n§7Нажми на лот, чтобы посмотреть и купить");
+                  }
+
+                  FormWindowSimple form = new FormWindowSimple("§l§6Рынок", content.toString());
+                  final List<Runnable> actions = new ArrayList<>();
+
+                  int from = st.page * PER_PAGE;
+                  for (int i = 0; i < PER_PAGE && from + i < list.size(); i++) {
+                      final Lot l = list.get(from + i);
+                      boolean own = uid.equals(l.seller);
+                      form.addButton(new ElementButton((own ? "§2[Ваш] §r§l" : "§l") + nameOf(l)
+                              + "\n§r§8" + l.price + " монет | " + l.sellerName));
+                      actions.add(() -> openLot(p, l.id));
+                  }
+                  if (st.page > 0) {
+                      form.addButton(new ElementButton("§e◀ Назад"));
+                      actions.add(() -> {
+                          st.page--;
+                          openList(p);
+                      });
+                  }
+                  if (st.page < pages - 1) {
+                      form.addButton(new ElementButton("§eВперёд ▶"));
+                      actions.add(() -> {
+                          st.page++;
+                          openList(p);
+                      });
+                  }
+                  form.addButton(new ElementButton("§bПоиск по названию"));
+                  actions.add(() -> openSearch(p));
+                  if (!st.search.isEmpty()) {
+                      form.addButton(new ElementButton("§cСбросить поиск"));
+                      actions.add(() -> {
+                          st.search = "";
+                          st.page = 0;
+                          openList(p);
+                      });
+                  }
+                  form.addButton(new ElementButton(st.mine ? "§eВсе лоты" : "§aМои лоты"));
+                  actions.add(() -> {
+                      st.mine = !st.mine;
+                      st.page = 0;
+                      openList(p);
+                  });
+                  form.addButton(new ElementButton("§6Статистика"));
+                  actions.add(() -> openStats(p));
+
+                  show(p, form, e -> {
+                      int id = clickedId(e);
+                      if (id >= 0 && id < actions.size()) {
+                          actions.get(id).run();
+                      }
+                  });
+              }
+
+              // ================= карточка лота =================
+
+              private void openLot(Player p, long id) {
+                  Lot lot = plugin.findLot(id);
+                  if (lot == null) {
+                      p.sendMessage("§cЛот уже продан или снят");
+                      openList(p);
+                      return;
+                  }
+                  boolean own = p.getUniqueId().toString().equals(lot.seller);
+                  Item it = lot.toItem();
+                  StringBuilder sb = new StringBuilder();
+                  sb.append("§6Предмет: §f").append(it.getName());
+                  if (it.getCount() > 1) {
+                      sb.append(" §7x").append(it.getCount());
+                  }
+                  Enchantment[] en = it.getEnchantments();
+                  if (en != null && en.length > 0) {
+                      sb.append("\n§6Чары: §f").append(Enchants.format(en));
+                  }
+                  sb.append("\n§6Цена: §e").append(lot.price).append(" монет");
+                  sb.append("\n§6Продавец: §f").append(lot.sellerName);
+                  if (!own) {
+                      long fee = lot.price * plugin.commission / 100L;
+                      sb.append("\n\n§7Комиссия ").append(plugin.commission).append("% (").append(fee).append(") берётся с продавца");
+                  }
+
+                  FormWindowSimple form = new FormWindowSimple("§l§6Лот", sb.toString());
+                  form.addButton(new ElementButton(own ? "§cСнять с продажи" : "§a§lКупить за " + lot.price));
+                  form.addButton(new ElementButton("§e◀ К списку"));
+
+                  final long lotId = id;
+                  show(p, form, e -> {
+                      int c = clickedId(e);
+                      if (c == 0) {
+                          if (own) {
+                              withdrawOwn(p, lotId);
+                          } else {
+                              Lot cur = plugin.findLot(lotId);
+                              if (cur != null && cur.price > plugin.confirmAbove) {
+                                  openConfirm(p, lotId);
+                              } else {
+                                  purchase(p, lotId);
+                              }
+                          }
+                      } else if (c == 1) {
+                          openList(p);
+                      }
+                  });
+              }
+
+              private void openConfirm(Player p, long id) {
+                  Lot lot = plugin.findLot(id);
+                  if (lot == null) {
+                      p.sendMessage("§cЛот уже продан или снят");
+                      openList(p);
+                      return;
+                  }
+                  FormWindowModal form = new FormWindowModal("§e§lПодтвердите покупку",
+                          "§fКупить §6" + nameOf(lot) + "§f за §e" + lot.price + " монет§f?\n§7Продавец: " + lot.sellerName,
+                          "§a§l✔ Купить", "§c§l✖ Отмена");
+                  show(p, form, e -> {
+                      boolean yes = false;
+                      if (!e.wasClosed() && e.getResponse() instanceof FormResponseModal) {
+                          yes = ((FormResponseModal) e.getResponse()).getClickedButtonId() == 0;
+                      }
+                      if (yes) {
+                          purchase(p, id);
+                      } else {
+                          p.sendMessage("§7Покупка отменена");
+                          openList(p);
+                      }
+                  });
+              }
+
+              // ================= статистика =================
+
+              private void openStats(Player p) {
+                  String uid = p.getUniqueId().toString();
+                  long bal = 0;
+                  try {
+                      bal = plugin.economy.getBalance(p.getName());
+                  } catch (Exception ignored) {
+                      // баланс покажем нулём
+                  }
+                  String text = "§7Продано на сумму: §e" + plugin.sold.getOrDefault(uid, 0L)
+                          + "\n§7Твоих лотов: §e" + plugin.countLots(p.getUniqueId()) + "§7/§e" + plugin.maxLots
+                          + "\n§7Всего лотов на рынке: §e" + plugin.lots.size()
+                          + "\n§7Твой баланс: §e" + bal;
+                  FormWindowSimple form = new FormWindowSimple("§6§lСтатистика", text);
+                  form.addButton(new ElementButton("§e◀ К списку"));
+                  show(p, form, e -> openList(p));
+              }
+
+              // ================= поиск =================
+
+              private void openSearch(Player p) {
+                  final State st = state(p);
+                  List<Element> el = new ArrayList<>();
+                  el.add(new ElementInput("Название предмета", "например: diamond sword"));
+                  show(p, new FormWindowCustom("§lПоиск на рынке", el), e -> {
+                      if (!e.wasClosed() && e.getResponse() instanceof FormResponseCustom) {
+                          String in = ((FormResponseCustom) e.getResponse()).getInputResponse(0);
+                          st.search = in == null ? "" : in.trim();
+                          st.page = 0;
+                      }
+                      openList(p);
+                  });
+              }
+
+              // ================= действия =================
+
+              private void withdrawOwn(Player p, long id) {
+                  Lot lot = plugin.findLot(id);
+                  if (lot == null || !p.getUniqueId().toString().equals(lot.seller)) {
+                      p.sendMessage("§cЛот уже продан или снят");
+                      openList(p);
+                      return;
+                  }
+                  Item item = lot.toItem();
+                  if (!p.getInventory().canAddItem(item)) {
+                      p.sendMessage("§cУ вас нет места в инвентаре!");
+                      return;
+                  }
+                  plugin.lots.remove(lot);
+                  p.getInventory().addItem(item);
+                  plugin.saveData();
+                  p.sendMessage("§aЛот снят с продажи, предмет возвращён");
+                  openList(p);
+              }
+
+              private void purchase(Player p, long id) {
+                  String uid = p.getUniqueId().toString();
+                  Lot lot = plugin.findLot(id);
+                  if (lot == null) {
+                      p.sendMessage("§cЛот уже продан или снят");
+                      openList(p);
+                      return;
+                  }
+                  if (uid.equals(lot.seller)) {
+                      openList(p);
+                      return;
+                  }
+                  Economy eco = plugin.economy;
+                  try {
+                      eco.ensureAccount(p);
+                      String buyer = p.getName();
+                      long price = lot.price;
+                      long bal = eco.getBalance(buyer);
+                      if (bal < price) {
+                          p.sendMessage("§cНедостаточно монет! Нужно §e" + price + "§c, у вас §e" + bal);
+                          return;
+                      }
+                      Item item = lot.toItem();
+                      if (!p.getInventory().canAddItem(item)) {
+                          p.sendMessage("§cУ вас нет места в инвентаре!");
+                          return;
+                      }
+                      long fee = price * plugin.commission / 100L;
+                      long payout = price - fee;
+                      if (payout > 0 && !eco.canReceive(lot.sellerName, payout)) {
+                          p.sendMessage("§cПродавец сейчас не может получить оплату (нет аккаунта или переполнен баланс)");
+                          return;
+                      }
+                      if (!eco.take(buyer, price)) {
+                          p.sendMessage("§cНе удалось снять монеты");
+                          return;
+                      }
+                      if (payout > 0 && !eco.add(lot.sellerName, payout)) {
+                          eco.add(buyer, price);
+                          p.sendMessage("§cОшибка оплаты, монеты возвращены");
+                          return;
+                      }
+                      plugin.lots.remove(lot);
+                      plugin.sold.merge(lot.seller, price, Long::sum);
+                      p.getInventory().addItem(item);
+                      plugin.saveData();
+
+                      String nm = item.getName() + (item.getCount() > 1 ? " §7x" + item.getCount() : "");
+                      p.sendMessage("§aВы купили §f" + nm + " §aза §e" + price + "§a. Баланс: §e" + eco.getBalance(buyer));
+                      try {
+                          Player sp = plugin.getServer().getOnlinePlayers().get(UUID.fromString(lot.seller));
+                          if (sp != null && sp.isOnline()) {
+                              sp.sendMessage("§aВаш лот §f" + nm + " §aкуплен игроком §f" + buyer
+                                      + "§a. Получено: §e" + payout + " §7(комиссия " + fee + ")");
+                          }
+                      } catch (Exception ignored) {
+                          // продавец не в сети
+                      }
+                  } catch (Exception e) {
+                      plugin.getLogger().error("[Auction] ошибка, этап: оплата", e);
+                      p.sendMessage("§cОшибка рынка (оплата): " + e);
+                      return;
+                  }
+                  openList(p);
+              }
+          }
+          EOF_7
+          cat > Auction/src/main/java/auction/AuctionPlugin.java << 'EOF_8'
+          package auction;
+
+          import auction.economy.Economy;
+          import auction.economy.TpCoinsEconomy;
+          import cn.nukkit.Player;
+          import cn.nukkit.command.Command;
+          import cn.nukkit.command.CommandSender;
+          import cn.nukkit.event.EventHandler;
+          import cn.nukkit.event.Listener;
+          import cn.nukkit.event.player.PlayerFormRespondedEvent;
+          import cn.nukkit.event.player.PlayerQuitEvent;
+          import cn.nukkit.item.Item;
+          import cn.nukkit.plugin.PluginBase;
+          import com.google.gson.Gson;
+          import com.google.gson.GsonBuilder;
+          import com.google.gson.reflect.TypeToken;
+
+          import java.io.File;
+          import java.io.FileInputStream;
+          import java.io.FileOutputStream;
+          import java.io.IOException;
+          import java.io.InputStreamReader;
+          import java.io.OutputStreamWriter;
+          import java.io.Reader;
+          import java.io.Writer;
+          import java.nio.charset.StandardCharsets;
+          import java.nio.file.Files;
+          import java.nio.file.StandardCopyOption;
+          import java.util.ArrayList;
+          import java.util.HashMap;
+          import java.util.List;
+          import java.util.Map;
+          import java.util.UUID;
+
+          public class AuctionPlugin extends PluginBase implements Listener {
+              private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+
+              public Economy economy;
+              public final List<Lot> lots = new ArrayList<>();
+              public final Map<String, Long> sold = new HashMap<>();
+              public int commission = 3;
+              public int maxLots = 10;
+              public long maxPrice = 300000;
+              public long confirmAbove = 50000;
+
+              private long nextId = 1;
+              private boolean loaded;
+              private File lotsFile;
+              private File statsFile;
+              private AuctionMenu menu;
+
+              @Override
+              public void onEnable() {
+                  saveDefaultConfig();
+                  commission = Math.max(0, Math.min(99, getConfig().getInt("commission-percent", 3)));
+                  maxLots = Math.max(1, getConfig().getInt("max-lots-per-player", 10));
+                  maxPrice = Math.max(1L, getConfig().getLong("max-price", 300000L));
+                  confirmAbove = Math.max(0L, getConfig().getLong("confirm-above", 50000L));
+
+                  getDataFolder().mkdirs();
+                  lotsFile = new File(getDataFolder(), "lots.json");
+                  statsFile = new File(getDataFolder(), "stats.json");
+
+                  try {
+                      economy = new TpCoinsEconomy(getServer());
+                  } catch (Exception e) {
+                      getLogger().error("Не удалось подключиться к TpCoins, плагин выключен", e);
+                      getServer().getPluginManager().disablePlugin(this);
+                      return;
+                  }
+
+                  loadData();
+                  menu = new AuctionMenu(this);
+                  getServer().getPluginManager().registerEvents(this, this);
+                  getLogger().info("Auction включён, лотов: " + lots.size());
+              }
+
+              @Override
+              public void onDisable() {
+                  saveData();
+              }
+
+              // ---------- данные ----------
+
+              private void loadData() {
+                  boolean ok = true;
+                  try {
+                      if (lotsFile.exists()) {
+                          try (Reader r = new InputStreamReader(new FileInputStream(lotsFile), StandardCharsets.UTF_8)) {
+                              List<Lot> l = GSON.fromJson(r, new TypeToken<List<Lot>>() {
+                              }.getType());
+                              if (l != null) {
+                                  lots.addAll(l);
+                              }
+                          }
+                      }
+                      if (statsFile.exists()) {
+                          try (Reader r = new InputStreamReader(new FileInputStream(statsFile), StandardCharsets.UTF_8)) {
+                              Map<String, Long> m = GSON.fromJson(r, new TypeToken<Map<String, Long>>() {
+                              }.getType());
+                              if (m != null) {
+                                  sold.putAll(m);
+                              }
+                          }
+                      }
+                  } catch (Exception e) {
+                      ok = false;
+                      getLogger().error("Не удалось прочитать данные рынка", e);
+                  }
+                  loaded = ok;
+                  for (Lot l : lots) {
+                      nextId = Math.max(nextId, l.id + 1);
+                  }
+              }
+
+              public void saveData() {
+                  if (!loaded) {
+                      return;
+                  }
+                  try {
+                      write(lotsFile, GSON.toJson(lots));
+                      write(statsFile, GSON.toJson(sold));
+                  } catch (Exception e) {
+                      getLogger().error("Не удалось сохранить данные рынка", e);
+                  }
+              }
+
+              private void write(File f, String json) throws IOException {
+                  File tmp = new File(f.getPath() + ".tmp");
+                  try (Writer w = new OutputStreamWriter(new FileOutputStream(tmp), StandardCharsets.UTF_8)) {
+                      w.write(json);
+                  }
+                  Files.move(tmp.toPath(), f.toPath(), StandardCopyOption.REPLACE_EXISTING);
+              }
+
+              public Lot findLot(long id) {
+                  for (Lot l : lots) {
+                      if (l.id == id) {
+                          return l;
+                      }
+                  }
+                  return null;
+              }
+
+              public int countLots(UUID seller) {
+                  String s = seller.toString();
+                  int n = 0;
+                  for (Lot l : lots) {
+                      if (s.equals(l.seller)) {
+                          n++;
+                      }
+                  }
+                  return n;
+              }
+
+              public void refreshAll() {
+                  // формы показывают актуальные данные при каждом открытии, обновлять нечего
+              }
+
+              // ---------- команды ----------
+
+              @Override
+              public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
+                  String name = command.getName().toLowerCase();
+                  if (!(sender instanceof Player)) {
+                      sender.sendMessage("§cТолько для игроков");
+                      return true;
+                  }
+                  Player p = (Player) sender;
+                  switch (name) {
+                      case "auc":
+                          menu.open(p);
+                          return true;
+                      case "bal":
+                          try {
+                              economy.ensureAccount(p);
+                              p.sendMessage("§aВаш баланс: §e" + economy.getBalance(p.getName()) + " §aмонет");
+                          } catch (Exception e) {
+                              getLogger().error("Ошибка /bal", e);
+                              p.sendMessage("§cНе удалось получить баланс");
+                          }
+                          return true;
+                      case "sell":
+                          sell(p, args);
+                          return true;
+                      default:
+                          return false;
+                  }
+              }
+
+              private void sell(Player p, String[] args) {
+                  if (args.length != 1) {
+                      p.sendMessage("§cИспользование: /sell <цена>");
+                      return;
+                  }
+                  long price;
+                  try {
+                      price = Long.parseLong(args[0].trim());
+                  } catch (NumberFormatException e) {
+                      p.sendMessage("§cЦена должна быть числом");
+                      return;
+                  }
+                  if (price < 1 || price > maxPrice) {
+                      p.sendMessage("§cЦена должна быть от 1 до " + maxPrice);
+                      return;
+                  }
+                  Item hand = p.getInventory().getItemInHand();
+                  if (hand == null || hand.getId() == 0 || hand.getCount() <= 0) {
+                      p.sendMessage("§cВозьмите предмет в руку");
+                      return;
+                  }
+                  if (countLots(p.getUniqueId()) >= maxLots) {
+                      p.sendMessage("§cМаксимум " + maxLots + " лотов одновременно");
+                      return;
+                  }
+                  try {
+                      economy.ensureAccount(p);
+                  } catch (Exception e) {
+                      getLogger().error("ensureAccount при /sell", e);
+                  }
+                  Item item = hand.clone();
+                  Lot lot = Lot.of(nextId++, p.getUniqueId(), p.getName(), price, item);
+                  lots.add(lot);
+                  p.getInventory().setItemInHand(Item.get(0));
+                  saveData();
+                  String nm = item.getName() + (item.getCount() > 1 ? " §7x" + item.getCount() : "");
+                  p.sendMessage("§aВыставлено: §f" + nm + " §aза §e" + price + "§a. Комиссия " + commission + "% удержится при продаже.");
+                  refreshAll();
+              }
+
+              // ---------- события ----------
+
+              @EventHandler
+              public void onForm(PlayerFormRespondedEvent e) {
+                  if (menu != null) {
+                      menu.handleForm(e);
+                  }
+              }
+
+              @EventHandler
+              public void onQuit(PlayerQuitEvent e) {
+                  if (menu != null) {
+                      menu.quit(e.getPlayer());
+                  }
+              }
+          }
+          EOF_8
+
+      - name: Сборка Maven
+        run: |
+          cd Auction
+          mvn -B clean package
+
+      - name: Загрузить jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: Auction-jar
+          path: Auction/target/Auction.jar
